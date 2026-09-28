@@ -63,27 +63,86 @@ export function scorePair(left: ArchiveRecord, right: ArchiveRecord) {
   return { score: Math.min(1, score), fieldScores, reasons };
 }
 
-export function computeMatches(records: ArchiveRecord[]): MatchCandidate[] {
-  const left = records.filter((record) => record.group === 'A');
-  const right = records.filter((record) => record.group === 'B');
+/** 返回两个配对共有的记录 id；不相交或同一配对时返回 undefined */
+export function sharedRecordId(match: MatchCandidate, other: MatchCandidate): string | undefined {
+  if (match.id === other.id) return undefined;
+  if (other.leftId === match.leftId || other.leftId === match.rightId) return other.leftId;
+  if (other.rightId === match.leftId || other.rightId === match.rightId) return other.rightId;
+  return undefined;
+}
+
+/**
+ * 查找占用目标配对任一条记录的已确认 / 已合并配对。
+ * 互斥规则：同一条记录不能同时进入两个已确认结果。
+ */
+export function findConfirmedBlocker(matches: MatchCandidate[], target: MatchCandidate): MatchCandidate | undefined {
+  return matches.find((other) =>
+    other.id !== target.id
+    && (other.status === 'confirmed' || other.status === 'merged')
+    && Boolean(sharedRecordId(target, other))
+  );
+}
+
+export function computeMatches(records: ArchiveRecord[], previous: MatchCandidate[] = []): MatchCandidate[] {
+  // 合并产物不再参与新一轮配对；已删除记录上的历史结论直接丢弃。
+  const live = new Map(
+    records.filter((record) => record.status !== 'merged').map((record) => [record.id, record])
+  );
+  const carried = new Map<string, MatchCandidate>();
+  previous.forEach((match) => {
+    if (match.status === 'suggested') return;
+    if (!live.has(match.leftId) || !live.has(match.rightId)) return;
+    carried.set(`${match.leftId}|${match.rightId}`, match);
+  });
+
+  const left = records.filter((record) => record.group === 'A' && record.status !== 'merged');
+  const right = records.filter((record) => record.group === 'B' && record.status !== 'merged');
   const matches: MatchCandidate[] = [];
+  const emitted = new Set<string>();
+
   left.forEach((a) => {
     const candidates = right.map((b) => ({ record: b, ...scorePair(a, b) }))
       .filter((item) => item.score >= .38)
       .sort((x, y) => y.score - x.score)
       .slice(0, 4);
     candidates.forEach((candidate) => {
+      const key = `${a.id}|${candidate.record.id}`;
+      const prior = carried.get(key);
+      emitted.add(key);
       matches.push({
         id: `match-${a.id}-${candidate.record.id}`,
         leftId: a.id,
         rightId: candidate.record.id,
         score: candidate.score,
         fieldScores: candidate.fieldScores,
-        status: 'suggested',
-        reasons: candidate.reasons
+        // 重新匹配只刷新分数与依据，原确认 / 忽略结论和复核时间原样保留。
+        status: prior ? prior.status : 'suggested',
+        reasons: candidate.reasons,
+        reviewedAt: prior?.reviewedAt
       });
     });
   });
+
+  // 原已复核配对若因分数变化跌出阈值，结论仍然保留，避免导出与审计里凭空消失。
+  carried.forEach((prior) => {
+    const key = `${prior.leftId}|${prior.rightId}`;
+    if (emitted.has(key)) return;
+    const a = live.get(prior.leftId);
+    const b = live.get(prior.rightId);
+    if (!a || !b) return;
+    const scored = scorePair(a, b);
+    matches.push({
+      id: prior.id,
+      leftId: prior.leftId,
+      rightId: prior.rightId,
+      score: scored.score,
+      fieldScores: scored.fieldScores,
+      status: prior.status,
+      reasons: scored.reasons,
+      reviewedAt: prior.reviewedAt
+    });
+  });
+
   return matches.sort((a, b) => b.score - a.score);
 }
 
