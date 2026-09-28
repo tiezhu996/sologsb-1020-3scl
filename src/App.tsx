@@ -3,7 +3,7 @@ import {
 } from '@builder.io/qwik';
 import { Checkbox, Modal, Tabs } from '@qwik-ui/headless';
 import type { ArchiveRecord, ArchiveState, FieldKey, MatchCandidate, RecordGroup } from './types';
-import { computeMatches, fieldValue, scorePair } from './utils/matching';
+import { fieldValue, rematchMatches } from './utils/matching';
 import { seedState } from './data/seed';
 
 const STORAGE_KEY = 'sologsb-1020-archive-state-v1';
@@ -23,6 +23,24 @@ const matchLabel = (state: ArchiveState, match: MatchCandidate) => {
   const left = recordById(state, match.leftId);
   const right = recordById(state, match.rightId);
   return `${left?.title ?? '未知记录'} ↔ ${right?.title ?? '未知记录'}`;
+};
+
+// 已确认或已合并的配对占用其两侧记录，互斥锁不允许同一记录再进另一套结果
+const lockedStatus = (status: MatchCandidate['status']) => status === 'confirmed' || status === 'merged';
+const sharesRecord = (a: MatchCandidate, b: MatchCandidate) =>
+  a.id !== b.id && (a.leftId === b.leftId || a.leftId === b.rightId || a.rightId === b.leftId || a.rightId === b.rightId);
+const lockedMatches = (state: ArchiveState) => state.matches.filter((match) => lockedStatus(match.status));
+const blockersOf = (state: ArchiveState, target: MatchCandidate) =>
+  lockedMatches(state).filter((lock) => sharesRecord(lock, target));
+const sharedRecordId = (a: MatchCandidate, b: MatchCandidate) =>
+  [a.leftId, a.rightId].find((id) => id === b.leftId || id === b.rightId)!;
+const statusText = (status: MatchCandidate['status']) =>
+  status === 'suggested' ? '待复核' : status === 'confirmed' ? '已确认' : status === 'rejected' ? '已忽略' : '已合并';
+
+const conflictNotice = (state: ArchiveState, target: MatchCandidate, blockers: MatchCandidate[]) => {
+  const blocker = blockers[0];
+  const shared = recordById(state, sharedRecordId(target, blocker));
+  return `与${statusText(blocker.status)}配对「${matchLabel(state, blocker)}」冲突：共同记录「${shared?.title ?? sharedRecordId(target, blocker)}」已归入该结果，需先忽略原配对`;
 };
 
 export default component$(() => {
@@ -104,19 +122,90 @@ export default component$(() => {
     .filter((match) => statusFilter.value === 'all' || match.status === statusFilter.value)
     .sort((a, b) => b.score - a.score));
 
-  const visibleMatches = useComputed$(() => filteredMatches.value.slice(0, 120));
+  // 冲突图：已锁定配对 -> 与它共用记录的待复核配对；待复核配对 -> 拦截它的锁定配对
+  const conflictGraph = useComputed$(() => {
+    const locking = new Map<string, MatchCandidate[]>();
+    const blockedBy = new Map<string, MatchCandidate[]>();
+    const locked = state.matches.filter((match) => lockedStatus(match.status));
+    const suggested = state.matches.filter((match) => match.status === 'suggested');
+    suggested.forEach((candidate) => {
+      const blockers = locked.filter((lock) => sharesRecord(lock, candidate));
+      if (blockers.length) {
+        blockedBy.set(candidate.id, blockers);
+        blockers.forEach((lock) => {
+          locking.set(lock.id, [...(locking.get(lock.id) ?? []), candidate]);
+        });
+      }
+    });
+    return { locking, blockedBy };
+  });
+
+  // 被互斥拦住的待复核配对总数，随确认/忽略实时增减
+  const blockedCount = useComputed$(() => conflictGraph.value.blockedBy.size);
+
+  // 队列排序：每条锁定配对后面紧跟与它冲突的待复核配对，共同记录与分数连着显示
+  const orderedMatches = useComputed$(() => {
+    const list = filteredMatches.value;
+    const attached = new Set<string>();
+    const ordered: MatchCandidate[] = [];
+    list.forEach((match) => {
+      if (lockedStatus(match.status)) {
+        ordered.push(match);
+        conflictGraph.value.locking.get(match.id)?.forEach((peer) => {
+          if (!attached.has(peer.id) && list.includes(peer)) {
+            ordered.push(peer);
+            attached.add(peer.id);
+          }
+        });
+      }
+    });
+    list.forEach((match) => { if (!attached.has(match.id) && !lockedStatus(match.status)) ordered.push(match); });
+    return ordered;
+  });
+
+  const visibleMatches = useComputed$(() => orderedMatches.value.slice(0, 120));
   const activeMatch = useComputed$(() => state.matches.find((match) => match.id === state.activeMatchId) ?? filteredMatches.value[0]);
+  const activeBlockers = useComputed$(() => (activeMatch.value && activeMatch.value.status === 'suggested'
+    ? conflictGraph.value.blockedBy.get(activeMatch.value.id) ?? []
+    : []));
   const conflictCount = useComputed$(() => state.matches.filter((match) => match.status === 'suggested' && match.score < .68).length);
 
+  // 配对不再占用记录时，若该记录没有其它已确认/已合并配对，则退回未核对
+  const syncRecordStatus = (match: MatchCandidate) => {
+    [match.leftId, match.rightId].forEach((recordId) => {
+      const stillLocked = state.matches.some((item) =>
+        item.id !== match.id && lockedStatus(item.status) && (item.leftId === recordId || item.rightId === recordId));
+      if (!stillLocked) {
+        const record = recordById(state, recordId);
+        if (record && record.status !== 'merged') record.status = 'unreviewed';
+      }
+    });
+  };
+
   const updateMatch = $((id: string, status: MatchCandidate['status']) => {
-    capture();
     const match = state.matches.find((item) => item.id === id);
     if (!match) return;
+    // 互斥：待复核配对与已确认/已合并结果共用记录时必须先处理冲突
+    if (status === 'confirmed' && match.status === 'suggested') {
+      const blockers = blockersOf(state, match);
+      if (blockers.length) {
+        state.activeMatchId = match.id;
+        statusFilter.value = 'all';
+        notify(conflictNotice(state, match, blockers));
+        return;
+      }
+    }
+    capture();
     match.status = status;
     match.reviewedAt = new Date().toISOString();
-    state.records.forEach((record) => {
-      if ((record.id === match.leftId || record.id === match.rightId) && status === 'confirmed') record.status = 'confirmed';
-    });
+    if (status === 'confirmed') {
+      [match.leftId, match.rightId].forEach((recordId) => {
+        const record = recordById(state, recordId);
+        if (record && record.status !== 'merged') record.status = 'confirmed';
+      });
+    } else if (status === 'rejected') {
+      syncRecordStatus(match);
+    }
     commit(status === 'confirmed' ? '确认匹配' : '忽略可疑匹配', matchLabel(state, match), [match.leftId, match.rightId]);
     notify(status === 'confirmed' ? '已确认此项匹配' : '已忽略此项匹配');
   });
@@ -124,24 +213,62 @@ export default component$(() => {
   const bulkMatch = $((status: MatchCandidate['status']) => {
     const ids = selectedMatchIds.value;
     if (!ids.length) return;
+    // 确认操作逐条做互斥检查：包括同批内先确认的配对，后面共用记录的也要拦下
+    const blocked: Array<{ match: MatchCandidate; blockers: MatchCandidate[] }> = [];
+    const newlyLockedIds = new Set<string>();
+    const dynamicLocks = (match: MatchCandidate) => state.matches
+      .filter((item) => item.id !== match.id && (lockedStatus(item.status) || newlyLockedIds.has(item.id)))
+      .filter((lock) => sharesRecord(lock, match));
+    if (status === 'confirmed') {
+      ids.forEach((id) => {
+        const match = state.matches.find((item) => item.id === id && item.status === 'suggested');
+        if (!match) return;
+        const blockers = dynamicLocks(match);
+        if (blockers.length) blocked.push({ match, blockers });
+        else newlyLockedIds.add(match.id);
+      });
+    }
+    const allowed = ids.filter((id) => !blocked.some((item) => item.match.id === id));
+    if (!allowed.length) {
+      const first = blocked[0];
+      notify(conflictNotice(state, first.match, first.blockers));
+      return;
+    }
     capture();
-    ids.forEach((id) => {
+    const reviewedAt = new Date().toISOString();
+    const recordIds: string[] = [];
+    allowed.forEach((id) => {
       const match = state.matches.find((item) => item.id === id);
       if (!match) return;
       match.status = status;
-      match.reviewedAt = new Date().toISOString();
+      match.reviewedAt = reviewedAt;
+      recordIds.push(match.leftId, match.rightId);
+      if (status === 'confirmed') {
+        [match.leftId, match.rightId].forEach((recordId) => {
+          const record = recordById(state, recordId);
+          if (record && record.status !== 'merged') record.status = 'confirmed';
+        });
+      } else {
+        syncRecordStatus(match);
+      }
     });
-    commit('批量复核', `${ids.length} 条匹配被标记为${status === 'confirmed' ? '确认' : '忽略'}`, ids.flatMap((id) => {
-      const match = state.matches.find((item) => item.id === id);
-      return match ? [match.leftId, match.rightId] : [];
-    }));
+    commit('批量复核', `${allowed.length} 条匹配被标记为${status === 'confirmed' ? '确认' : '忽略'}${blocked.length ? `，${blocked.length} 条因互斥冲突被拦下` : ''}`, [...new Set(recordIds)]);
     selectedMatchIds.value = [];
-    notify(`已批量处理 ${ids.length} 条匹配`);
+    notify(blocked.length
+      ? `已处理 ${allowed.length} 条，${blocked.length} 条与已确认配对冲突被拦下`
+      : `已批量处理 ${allowed.length} 条匹配`);
   });
 
   const openMerge = $(() => {
     const match = activeMatch.value;
     if (!match) return;
+    if (match.status === 'suggested') {
+      const blockers = blockersOf(state, match);
+      if (blockers.length) {
+        notify(conflictNotice(state, match, blockers));
+        return;
+      }
+    }
     state.activeMatchId = match.id;
     fieldLabels.forEach(([field]) => {
       const left = recordById(state, match.leftId);
@@ -178,9 +305,16 @@ export default component$(() => {
       updatedAt: new Date().toISOString()
     };
     state.records = [...state.records.filter((record) => record.id !== left.id && record.id !== right.id), merged];
+    const reviewedAt = new Date().toISOString();
     state.matches.forEach((item) => {
-      if (item.id === match.id) item.status = 'merged';
-      else if (item.leftId === left.id || item.rightId === right.id || item.leftId === right.id || item.rightId === left.id) item.status = 'rejected';
+      if (item.id === match.id) {
+        item.status = 'merged';
+        item.reviewedAt = reviewedAt;
+      } else if (sharesRecord(item, match) && item.status === 'suggested') {
+        // 记录已被合并取代，共用记录的待复核配对自动关闭，已确认/已忽略的人工决定保留
+        item.status = 'rejected';
+        item.reviewedAt = reviewedAt;
+      }
     });
     state.merges.unshift({
       id: crypto.randomUUID(),
@@ -243,12 +377,18 @@ export default component$(() => {
       };
       state.records.push(record);
     });
-    state.matches = computeMatches(state.records);
-    commit('导入档案记录', `从 ${importGroup.value} 组导入 ${rows.length} 条记录`, []);
+    // 重新匹配保留原确认、忽略与复核时间，仅新组合进入待复核
+    const result = rematchMatches(state.records, state.matches);
+    state.matches = result.matches;
+    commit(
+      '导入档案记录',
+      `从 ${importGroup.value} 组导入 ${rows.length} 条记录并重新匹配：${result.added} 条新组合待复核，保留 ${result.retained} 条原确认/忽略决定${result.displaced ? `，${result.displaced} 条已复核配对移出候选窗口仍保留` : ''}`,
+      []
+    );
     importRaw.value = '';
     importText.value = '';
     importOpen.value = false;
-    notify(`已导入 ${rows.length} 条记录并重新匹配`);
+    notify(`已导入 ${rows.length} 条记录：${result.added} 条新配对待复核，原有决定与复核时间已保留`);
   });
 
   const importFile = $(async (_event: Event, element: HTMLInputElement) => {
@@ -269,9 +409,10 @@ export default component$(() => {
   });
 
   const moveReview = $((delta: number) => {
-    const list = filteredMatches.value;
+    const list = orderedMatches.value;
     const index = list.findIndex((match) => match.id === activeMatch.value?.id);
-    const next = list[Math.max(0, Math.min(list.length - 1, index + delta))];
+    const current = index < 0 ? 0 : index;
+    const next = list[Math.max(0, Math.min(list.length - 1, current + delta))];
     if (next) {
       state.activeMatchId = next.id;
       document.querySelector(`[data-match-id="${next.id}"]`)?.scrollIntoView({ behavior: 'smooth', block: 'center' });
@@ -342,6 +483,7 @@ export default component$(() => {
           <div><strong>{state.records.filter((record) => record.group === 'A').length}</strong><span>A 组记录</span></div>
           <div><strong>{state.records.filter((record) => record.group === 'B').length}</strong><span>B 组记录</span></div>
           <div><strong>{state.matches.filter((match) => match.status === 'suggested').length}</strong><span>待复核匹配</span></div>
+          <div class="danger" title="与已确认或已合并结果共用记录、确认被拦的待复核配对数"><strong>{blockedCount.value}</strong><span>互斥拦截</span></div>
           <div class="danger"><strong>{conflictCount.value}</strong><span>低分可疑项</span></div>
         </div>
       </div>
@@ -364,10 +506,14 @@ export default component$(() => {
               const left = recordById(state, match.leftId);
               const right = recordById(state, match.rightId);
               const isActive = () => state.activeMatchId === match.id;
+              const blockers = conflictGraph.value.blockedBy.get(match.id) ?? [];
+              const lockingPeers = conflictGraph.value.locking.get(match.id) ?? [];
+              const isBlocked = blockers.length > 0;
+              const isLocking = lockingPeers.length > 0;
               return (
                 <article
                   data-match-id={match.id}
-                  class={`match-card ${isActive() ? 'active' : ''}`}
+                  class={`match-card ${isActive() ? 'active' : ''} ${isBlocked ? 'blocked' : ''} ${isLocking ? 'locking' : ''}`}
                   onClick$={() => { state.activeMatchId = match.id; }}
                   tabIndex={0}
                 >
@@ -384,15 +530,48 @@ export default component$(() => {
                       }}
                     ><Checkbox.Indicator>✓</Checkbox.Indicator></Checkbox.Root>
                     <span class={`score ${match.score < .68 ? 'low' : ''}`}>{Math.round(match.score * 100)}%</span>
-                    <span class={`status ${match.status}`}>{match.status === 'suggested' ? '待复核' : match.status === 'confirmed' ? '已确认' : match.status === 'rejected' ? '已忽略' : '已合并'}</span>
+                    <span class={`status ${match.status}`}>{statusText(match.status)}</span>
+                    {isBlocked && <span class="mutex-badge">互斥拦截</span>}
+                    {isLocking && <span class="mutex-badge locking">占用 {lockingPeers.length} 条</span>}
                     <span class="record-id">{left?.identifier}</span>
                   </div>
                   <div class="pair-preview">
-                    <div><small>A · {left?.group}</small><strong>{left?.title}</strong><span>{parseDate(left?.date ?? '')} · {left?.people.join('、')}</span></div>
+                    <div><small>A · {left?.group}</small><strong>{left?.title ?? '记录已合并'}</strong><span>{parseDate(left?.date ?? '')} · {left?.people.join('、')}</span></div>
                     <i>↔</i>
-                    <div><small>B · {right?.group}</small><strong>{right?.title}</strong><span>{parseDate(right?.date ?? '')} · {right?.people.join('、')}</span></div>
+                    <div><small>B · {right?.group}</small><strong>{right?.title ?? '记录已合并'}</strong><span>{parseDate(right?.date ?? '')} · {right?.people.join('、')}</span></div>
                   </div>
                   <div class="reason-line">{match.reasons.join(' · ')}</div>
+                  {isBlocked && <div class="conflict-strip">
+                    <div class="conflict-head">⛔ 与 {blockers.length} 条已锁定结果共用记录，确认被拦：先忽略原配对才能继续</div>
+                    {blockers.map((blocker) => {
+                      const sharedId = sharedRecordId(match, blocker);
+                      const shared = recordById(state, sharedId);
+                      return (
+                        <div class="conflict-row" key={blocker.id} onClick$={(event: Event) => { event.stopPropagation(); state.activeMatchId = blocker.id; }}>
+                          <span class="conflict-link">查看冲突方</span>
+                          <strong>{matchLabel(state, blocker)}</strong>
+                          <em class={`status ${blocker.status}`}>{statusText(blocker.status)} {Math.round(blocker.score * 100)}%</em>
+                          <span class="conflict-shared">共同记录：{shared?.title ?? sharedId} · 本条 {Math.round(match.score * 100)}%</span>
+                          <button class="button small danger" onClick$={(event: Event) => { event.stopPropagation(); updateMatch(blocker.id, 'rejected'); }}>忽略原配对</button>
+                        </div>
+                      );
+                    })}
+                  </div>}
+                  {isLocking && <div class="conflict-strip locking-strip">
+                    <div class="conflict-head">🔒 已锁定 {lockingPeers.length} 条共用记录的待复核配对：</div>
+                    {lockingPeers.map((peer) => {
+                      const sharedId = sharedRecordId(match, peer);
+                      const shared = recordById(state, sharedId);
+                      return (
+                        <div class="conflict-row" key={peer.id} onClick$={(event: Event) => { event.stopPropagation(); state.activeMatchId = peer.id; }}>
+                          <span class="conflict-link">查看被拦配对</span>
+                          <strong>{matchLabel(state, peer)}</strong>
+                          <em class={`score ${peer.score < .68 ? 'low' : ''}`}>{Math.round(peer.score * 100)}%</em>
+                          <span class="conflict-shared">共同记录：{shared?.title ?? sharedId} · 本条 {Math.round(match.score * 100)}%</span>
+                        </div>
+                      );
+                    })}
+                  </div>}
                 </article>
               );
             })}
@@ -430,17 +609,43 @@ export default component$(() => {
           <Tabs.Root bind:selectedIndex={panelTab} class="review-tabs">
             <Tabs.List class="tab-list"><Tabs.Tab>复核详情</Tabs.Tab><Tabs.Tab>合并追溯</Tabs.Tab><Tabs.Tab>键盘帮助</Tabs.Tab></Tabs.List>
             <Tabs.Panel class="tab-panel">
-              {activeMatch.value ? (() => {
-                const left = recordById(state, activeMatch.value!.leftId)!;
-                const right = recordById(state, activeMatch.value!.rightId)!;
+              {activeMatch.value && (() => {
+                const left = recordById(state, activeMatch.value!.leftId);
+                const right = recordById(state, activeMatch.value!.rightId);
+                if (!left || !right) return <div class="empty-state">该配对的原始记录已在合并中归档，字段来源请查看下方「合并追溯」。</div>;
+                const blockers = activeBlockers.value;
                 return <>
                   <div class="active-score"><span>{Math.round(activeMatch.value!.score * 100)}</span><div><strong>综合匹配分</strong><small>{activeMatch.value!.reasons.join(' · ')}</small></div></div>
+                  {blockers.length > 0 && <div class="mutex-banner">
+                    <strong>⛔ 互斥冲突：确认被拦住</strong>
+                    {blockers.map((blocker) => {
+                      const sharedId = sharedRecordId(activeMatch.value!, blocker);
+                      const shared = recordById(state, sharedId);
+                      return (
+                        <div class="mutex-line" key={blocker.id}>
+                          <p>共同记录「{shared?.title ?? sharedId}」已归入{statusText(blocker.status)}配对「{matchLabel(state, blocker)}」（{Math.round(blocker.score * 100)}%），本项 {Math.round(activeMatch.value!.score * 100)}%。忽略原配对后才能确认本项。</p>
+                          <div class="mutex-actions">
+                            <button class="button small ghost" onClick$={() => { state.activeMatchId = blocker.id; }}>查看冲突方</button>
+                            <button class="button small danger" onClick$={() => updateMatch(blocker.id, 'rejected')}>忽略原配对</button>
+                          </div>
+                        </div>
+                      );
+                    })}
+                  </div>}
                   <div class="field-compare compact"><div class="field-label">字段</div><div>A 来源</div><div>B 来源</div>
                     {fieldLabels.map(([field, label]) => <><div class="field-label">{label}</div><div class={fieldValue(left, field) !== fieldValue(right, field) ? 'different' : ''}>{fieldValue(left, field) || '—'}</div><div class={fieldValue(left, field) !== fieldValue(right, field) ? 'different' : ''}>{fieldValue(right, field) || '—'}</div></>)}
                   </div>
-                  <div class="action-stack"><button class="button primary wide" onClick$={openMerge}>逐字段合并</button><div class="split-actions"><button class="button confirm" onClick$={() => updateMatch(activeMatch.value!.id, 'confirmed')}>确认匹配</button><button class="button ghost" onClick$={() => updateMatch(activeMatch.value!.id, 'rejected')}>忽略</button></div></div>
+                  <div class="action-stack">
+                    <button class="button primary wide" disabled={blockers.length > 0} onClick$={openMerge} title={blockers.length > 0 ? '存在互斥冲突，先忽略原配对' : ''}>逐字段合并</button>
+                    <div class="split-actions">
+                      <button class="button confirm" disabled={blockers.length > 0} onClick$={() => updateMatch(activeMatch.value!.id, 'confirmed')}>{blockers.length > 0 ? '确认被互斥拦住' : '确认匹配'}</button>
+                      <button class="button ghost" onClick$={() => updateMatch(activeMatch.value!.id, 'rejected')}>忽略</button>
+                    </div>
+                    {activeMatch.value!.reviewedAt && <div class="reviewed-at">上次复核：{new Date(activeMatch.value!.reviewedAt).toLocaleString('zh-CN')}</div>}
+                  </div>
                 </>;
-              })() : <div class="empty-state">从左侧选择一条匹配查看字段来源。</div>}
+              })()}
+              {!activeMatch.value && <div class="empty-state">从左侧选择一条匹配查看字段来源。</div>}
             </Tabs.Panel>
             <Tabs.Panel class="tab-panel">
               {state.merges.length ? state.merges.map((merge) => {
@@ -466,9 +671,10 @@ export default component$(() => {
         <article class="panel explanation-panel">
           <div class="panel-heading"><div><span class="eyebrow">METHOD</span><h3>匹配与保护规则</h3></div></div>
           <p>标题、日期、人物、地点和编号按权重综合评分。低于 68% 的候选会以红色标记，但系统不会替研究者自动决定。</p>
-          <div class="rule-row"><span>1</span><p>每个字段保留 A / B 来源，可在合并窗口中单独选择或拼接。</p></div>
-          <div class="rule-row"><span>2</span><p>原始记录、合并结果和忽略理由都进入本地审计轨迹。</p></div>
-          <div class="rule-row"><span>3</span><p>记录列表使用分批窗口渲染，导入大量数据时仍只挂载当前窗口。</p></div>
+          <div class="rule-row"><span>1</span><p>配对互斥：记录进入已确认/已合并结果后，再确认共用它的配对会被拦住，需先忽略原配对；冲突双方在队列中相邻显示共同记录与分数。</p></div>
+          <div class="rule-row"><span>2</span><p>每个字段保留 A / B 来源，可在合并窗口中单独选择或拼接。</p></div>
+          <div class="rule-row"><span>3</span><p>导入后重新匹配保留原确认、忽略与复核时间，仅新组合进入待复核；撤销重做、离线保存与导出同步。</p></div>
+          <div class="rule-row"><span>4</span><p>原始记录、合并结果和忽略动作都进入本地审计轨迹，记录列表分批窗口渲染。</p></div>
         </article>
       </section>
 

@@ -64,8 +64,10 @@ export function scorePair(left: ArchiveRecord, right: ArchiveRecord) {
 }
 
 export function computeMatches(records: ArchiveRecord[]): MatchCandidate[] {
-  const left = records.filter((record) => record.group === 'A');
-  const right = records.filter((record) => record.group === 'B');
+  // 已合并记录已被合并结果取代，不再参与新候选，否则会产生幻影配对
+  const active = records.filter((record) => record.status !== 'merged');
+  const left = active.filter((record) => record.group === 'A');
+  const right = active.filter((record) => record.group === 'B');
   const matches: MatchCandidate[] = [];
   left.forEach((a) => {
     const candidates = right.map((b) => ({ record: b, ...scorePair(a, b) }))
@@ -85,6 +87,47 @@ export function computeMatches(records: ArchiveRecord[]): MatchCandidate[] {
     });
   });
   return matches.sort((a, b) => b.score - a.score);
+}
+
+export interface RematchResult {
+  matches: MatchCandidate[];
+  /** 新候选里沿用了旧决定（确认/忽略/复核时间）的配对数 */
+  retained: number;
+  /** 因新记录挤出候选窗口、但已复核过而强制保留的旧配对数 */
+  displaced: number;
+  /** 全新组合、等待复核的配对数 */
+  added: number;
+}
+
+/**
+ * 导入后重新匹配：配对 id 由两侧记录 id 决定，同一组合的确认、忽略
+ * 状态和 reviewedAt 一律沿用；只有新组合以 suggested 进入待复核队列。
+ */
+export function rematchMatches(records: ArchiveRecord[], previous: MatchCandidate[]): RematchResult {
+  const previousById = new Map(previous.map((match) => [match.id, match]));
+  const matches: MatchCandidate[] = [];
+  let retained = 0;
+  let added = 0;
+  computeMatches(records).forEach((candidate) => {
+    const old = previousById.get(candidate.id);
+    if (old) {
+      previousById.delete(candidate.id);
+      retained += 1;
+      // 分数与依据随数据重算，但人工决定和复核时间原样保留
+      matches.push({ ...candidate, status: old.status, reviewedAt: old.reviewedAt });
+    } else {
+      added += 1;
+      matches.push(candidate);
+    }
+  });
+  // 旧配对没进新的 top4 候选窗口：只要人工处理过就保留，审计可继续追溯
+  const displacedList = [...previousById.values()].filter((match) => match.status !== 'suggested' || Boolean(match.reviewedAt));
+  return {
+    matches: matches.concat(displacedList).sort((a, b) => b.score - a.score),
+    retained,
+    displaced: displacedList.length,
+    added
+  };
 }
 
 export function fieldValue(record: ArchiveRecord, field: FieldKey): string {
